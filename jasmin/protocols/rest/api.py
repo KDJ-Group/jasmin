@@ -184,11 +184,61 @@ class SendBatchResource(JasminRestApi, JasminHttpApiProxy):
             else:
                 return (schedule_at - datetime.now()).total_seconds()
 
+    def _queue_message(self, batch_id, batch_config, message_params, config, countdown):
+        """Queue a single message for sending via Celery task.
+
+        Generates a unique messageId for tracking purposes and dispatches the
+        message to a Celery worker. The messageId is included in the task
+        arguments so it can be correlated with the actual Jasmin message ID
+        once the send completes.
+
+        :param batch_id: UUID of the batch
+        :param batch_config: Batch-level configuration (callbacks, scheduling)
+        :param message_params: Individual message parameters (to, content, etc.)
+        :param config: Worker configuration (throughput, smart_qos)
+        :param countdown: Scheduling delay in seconds (0 for immediate)
+        :return: dict with 'to', 'messageId', and 'status' for this message
+        """
+        message_id = '%s' % uuid.uuid4()
+        to = message_params['to']
+
+        if countdown == 0:
+            httpapi_send.delay(batch_id, batch_config, message_params, config, message_id)
+        else:
+            httpapi_send.apply_async(
+                args=[batch_id, batch_config, message_params, config, message_id],
+                countdown=countdown)
+
+        # Status reflects the current state at response time:
+        # - "QUEUED": message is dispatched for immediate sending
+        # - "SCHEDULED": message will be sent after the countdown delay
+        # TODO: For real-time status tracking, consider implementing a status
+        # endpoint (e.g. GET /secure/batch/{batchId}/messages) backed by Redis
+        status = 'SCHEDULED' if countdown > 0 else 'QUEUED'
+
+        return {'to': to, 'messageId': message_id, 'status': status}
+
     def on_post(self, request, response):
         """
         POST /secure/sendbatch request processing
 
         Note: Calls Jasmin http api /send resource
+
+        Returns a response containing batchId, messageCount, and a messages array
+        with individual tracking messageIds for each queued SMS.
+
+        Example response:
+        {
+            "data": {
+                "batchId": "af268b6b-1ace-4413-b9d2-529f4942fd9e",
+                "messageCount": 3,
+                "messages": [
+                    {"to": "+2376XXXXXXX", "messageId": "...", "status": "QUEUED"},
+                    {"to": "+2376XXXXXXX", "messageId": "...", "status": "QUEUED"},
+                    {"to": "+2376XXXXXXX", "messageId": "...", "status": "QUEUED"}
+                ]
+            }
+        }
         """
 
         # Authentify user before proceeding
@@ -208,6 +258,9 @@ class SendBatchResource(JasminRestApi, JasminHttpApiProxy):
         countdown = self.parse_schedule_at(params.get('batch_config', {}).get('schedule_at', None))
 
         message_count = 0
+        # Collect individual message tracking details for the response
+        messages = []
+
         for _message_params in params.get('messages', {}):
             # Construct message params
             message_params = {'username': request.context.get('username'),
@@ -233,25 +286,21 @@ class SendBatchResource(JasminRestApi, JasminHttpApiProxy):
                 to_list = message_params.get('to')
                 for _to in to_list:
                     message_params['to'] = _to
-                    if countdown == 0:
-                        httpapi_send.delay(batch_id, params.get('batch_config', {}), message_params, config)
-                    else:
-                        httpapi_send.apply_async(
-                            args=[batch_id, params.get('batch_config', {}), message_params, config],
-                            countdown=countdown)
+                    msg_detail = self._queue_message(
+                        batch_id, params.get('batch_config', {}), message_params, config, countdown)
+                    messages.append(msg_detail)
                     message_count += 1
             else:
-                if countdown == 0:
-                    httpapi_send.delay(batch_id, params.get('batch_config', {}), message_params, config)
-                else:
-                    httpapi_send.apply_async(
-                        args=[batch_id, params.get('batch_config', {}), message_params, config], countdown=countdown)
+                msg_detail = self._queue_message(
+                    batch_id, params.get('batch_config', {}), message_params, config, countdown)
+                messages.append(msg_detail)
                 message_count += 1
 
         response.body = {
             'data': {
                 "batchId": '%s' % batch_id,
-                "messageCount": message_count
+                "messageCount": message_count,
+                "messages": messages
             }
         }
         if countdown > 0:

@@ -31,9 +31,18 @@ class JasminTask(Task):
 
 
 @task(bind=True, base=JasminTask)
-def httpapi_send(self, batch_id, batch_config, message_params, config):
+def httpapi_send(self, batch_id, batch_config, message_params, config, message_id=None):
     """Calls Jasmin's /send http api, if we have errback_url and callback_url in batch_config then
-    will callback those urls asynchronously to inform user of batch progression"""
+    will callback those urls asynchronously to inform user of batch progression.
+
+    :param batch_id: UUID of the batch this message belongs to
+    :param batch_config: Batch-level configuration (callback_url, errback_url, etc.)
+    :param message_params: Parameters for the /send call (to, content, etc.)
+    :param config: Worker-level configuration (throughput, smart_qos)
+    :param message_id: Pre-generated tracking message ID assigned at queue time.
+        This ID is returned in the batch response and can be used to correlate
+        with the actual Jasmin message ID returned by /send.
+    """
     try:
         slow_down_seconds = 0
         # Shall we do QoS control ?
@@ -52,15 +61,15 @@ def httpapi_send(self, batch_id, batch_config, message_params, config):
 
         r = requests.get('%s/send' % old_api_uri, params=message_params)
     except requests.exceptions.ConnectionError as e:
-        logger.error('[%s] Jasmin httpapi connection error: %s' % (batch_id, e))
+        logger.error('[%s] [msgid:%s] Jasmin httpapi connection error: %s' % (batch_id, message_id, e))
         if batch_config.get('errback_url', None):
             batch_callback.delay(batch_config.get('errback_url'), batch_id, message_params['to'], 0,
-                                 'HTTPAPI Connection error: %s' % e)
+                                 'HTTPAPI Connection error: %s' % e, message_id)
     except Exception as e:
-        logger.error('[%s] Unknown error (%s): %s' % (batch_id, type(e), e))
+        logger.error('[%s] [msgid:%s] Unknown error (%s): %s' % (batch_id, message_id, type(e), e))
         if batch_config.get('errback_url', None):
             batch_callback.delay(batch_config.get('errback_url'), batch_id, message_params['to'], 0,
-                                 'Unknown error: %s' % e)
+                                 'Unknown error: %s' % e, message_id)
     else:
         # Useful for QoS control
         self.worker_tracker['last_req_at'] = datetime.now()
@@ -95,26 +104,44 @@ def httpapi_send(self, batch_id, batch_config, message_params, config):
 
         # Return status back
         if r.status_code != 200:
-            logger.error('[%s] %s' % (batch_id, r.text.strip('"')))
+            logger.error('[%s] [msgid:%s] %s' % (batch_id, message_id, r.text.strip('"')))
             if batch_config.get('errback_url', None):
                 batch_callback.delay(
                     batch_config.get('errback_url'), batch_id, message_params['to'], 0,
-                    'HTTPAPI error: %s' % r.text.strip('"'))
+                    'HTTPAPI error: %s' % r.text.strip('"'), message_id)
         else:
+            # Log correlation between tracking messageId and Jasmin's actual message ID
+            # TODO: Optionally store this mapping in Redis for status lookup
+            # (e.g. key: msgid:{message_id} -> value: jasmin_msgid from r.text)
+            logger.info('[%s] [msgid:%s] Jasmin response: %s' % (batch_id, message_id, r.text.strip('"')))
             if batch_config.get('callback_url', None):
                 batch_callback.delay(
-                    batch_config.get('callback_url'), batch_id, message_params['to'], 1, r.text)
+                    batch_config.get('callback_url'), batch_id, message_params['to'], 1, r.text, message_id)
 
 
 @task(bind=True, base=JasminTask)
-def batch_callback(self, url, batch_id, to, status, status_text):
+def batch_callback(self, url, batch_id, to, status, status_text, message_id=None):
+    """Calls the configured callback/errback URL to report message status.
+
+    :param url: The callback or errback URL to call
+    :param batch_id: UUID of the batch
+    :param to: Destination phone number
+    :param status: 1 for success, 0 for error
+    :param status_text: Descriptive text (Jasmin response or error message)
+    :param message_id: Pre-generated tracking message ID (optional, for correlation)
+    """
     try:
         if status == 0:
             operation_name = 'Errback'
         else:
             operation_name = 'Callback'
 
-        requests.get(url, params={'batchId': batch_id, 'to': to, 'status': status, 'statusText': status_text})
+        callback_params = {'batchId': batch_id, 'to': to, 'status': status, 'statusText': status_text}
+        # Include messageId in callback if available
+        if message_id is not None:
+            callback_params['messageId'] = message_id
+
+        requests.get(url, params=callback_params)
     except Exception as e:
         logger.error('(%s) of batch %s to %s failed (%s): %s.' % (operation_name, batch_id, url, type(e), e))
     else:
