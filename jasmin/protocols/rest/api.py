@@ -212,8 +212,9 @@ class SendBatchResource(JasminRestApi, JasminHttpApiProxy):
         # Status reflects the current state at response time:
         # - "QUEUED": message is dispatched for immediate sending
         # - "SCHEDULED": message will be sent after the countdown delay
-        # TODO: For real-time status tracking, consider implementing a status
-        # endpoint (e.g. GET /secure/batch/{batchId}/messages) backed by Redis
+        # TODO: For real-time status tracking, implement a GET /secure/batch/{batchId}/messages
+        # endpoint backed by Redis. The httpapi_send task (tasks.py) logs the correlation between
+        # this messageId and the actual Jasmin message ID returned by /send.
         status = 'SCHEDULED' if countdown > 0 else 'QUEUED'
 
         return {'to': to, 'messageId': message_id, 'status': status}

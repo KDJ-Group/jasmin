@@ -61,12 +61,14 @@ def httpapi_send(self, batch_id, batch_config, message_params, config, message_i
 
         r = requests.get('%s/send' % old_api_uri, params=message_params)
     except requests.exceptions.ConnectionError as e:
-        logger.error('[%s] [msgid:%s] Jasmin httpapi connection error: %s' % (batch_id, message_id, e))
+        msgid_tag = '[msgid:%s] ' % message_id if message_id else ''
+        logger.error('[%s] %sJasmin httpapi connection error: %s' % (batch_id, msgid_tag, e))
         if batch_config.get('errback_url', None):
             batch_callback.delay(batch_config.get('errback_url'), batch_id, message_params['to'], 0,
                                  'HTTPAPI Connection error: %s' % e, message_id)
     except Exception as e:
-        logger.error('[%s] [msgid:%s] Unknown error (%s): %s' % (batch_id, message_id, type(e), e))
+        msgid_tag = '[msgid:%s] ' % message_id if message_id else ''
+        logger.error('[%s] %sUnknown error (%s): %s' % (batch_id, msgid_tag, type(e), e))
         if batch_config.get('errback_url', None):
             batch_callback.delay(batch_config.get('errback_url'), batch_id, message_params['to'], 0,
                                  'Unknown error: %s' % e, message_id)
@@ -104,16 +106,20 @@ def httpapi_send(self, batch_id, batch_config, message_params, config, message_i
 
         # Return status back
         if r.status_code != 200:
-            logger.error('[%s] [msgid:%s] %s' % (batch_id, message_id, r.text.strip('"')))
+            msgid_tag = '[msgid:%s] ' % message_id if message_id else ''
+            logger.error('[%s] %s%s' % (batch_id, msgid_tag, r.text.strip('"')))
             if batch_config.get('errback_url', None):
                 batch_callback.delay(
                     batch_config.get('errback_url'), batch_id, message_params['to'], 0,
                     'HTTPAPI error: %s' % r.text.strip('"'), message_id)
         else:
-            # Log correlation between tracking messageId and Jasmin's actual message ID
-            # TODO: Optionally store this mapping in Redis for status lookup
-            # (e.g. key: msgid:{message_id} -> value: jasmin_msgid from r.text)
-            logger.info('[%s] [msgid:%s] Jasmin response: %s' % (batch_id, message_id, r.text.strip('"')))
+            # Log correlation between tracking messageId and Jasmin's actual message ID.
+            # Jasmin /send returns 'Success "jasmin-message-id"' on success.
+            # TODO: For full message-level status tracking, store this mapping in Redis
+            # (e.g. key: msgid:{message_id} -> value: jasmin_msgid extracted from r.text)
+            # and expose it via a GET /secure/batch/{batchId}/messages endpoint.
+            if message_id:
+                logger.info('[%s] [msgid:%s] Jasmin response: %s' % (batch_id, message_id, r.text.strip('"')))
             if batch_config.get('callback_url', None):
                 batch_callback.delay(
                     batch_config.get('callback_url'), batch_id, message_params['to'], 1, r.text, message_id)
